@@ -12,7 +12,6 @@ on:
 
 env:
   PYTHON_VERSION: ${{ github.event.inputs.python_version || '3.11' }}
-  IMAGE_NAME: my-python-app
 
 jobs:
   build-and-push:
@@ -41,7 +40,7 @@ jobs:
           build-args: |
             PYTHON_VERSION=${{ env.PYTHON_VERSION }}
           tags: |
-            ${{ secrets.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.PYTHON_VERSION }}
-            ${{ secrets.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ secrets.DOCKER_REGISTRY }}:${{ env.PYTHON_VERSION }}
+            ${{ secrets.DOCKER_REGISTRY }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
