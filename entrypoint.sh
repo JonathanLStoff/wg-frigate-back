@@ -75,11 +75,66 @@ if ! validate_schedule "$SCHEDULE"; then
     exit 1
 fi
 
+# --- WireGuard tunnel ---
+# All container traffic is routed through the tunnel (assuming the config's
+# AllowedIPs covers 0.0.0.0/0). Requires: --cap-add NET_ADMIN and, for
+# full-tunnel routing inside a container,
+# --sysctl net.ipv4.conf.all.src_valid_mark=1
+if [ -z "${WG_CONFIG_PATH:-}" ]; then
+    echo "ERROR: WG_CONFIG_PATH is not set (path to a WireGuard .conf file)." >&2
+    exit 1
+fi
+
+if [ ! -f "$WG_CONFIG_PATH" ]; then
+    echo "ERROR: WireGuard config not found at '$WG_CONFIG_PATH'." >&2
+    echo "Mount it into the container, e.g. -v ./wg0.conf:$WG_CONFIG_PATH:ro" >&2
+    exit 1
+fi
+
+# wg-quick shells out to resolvconf when the config contains a DNS= line,
+# and the slim image doesn't ship it. Work from a DNS-free copy in a tmp
+# dir; this also lets the original be mounted read-only.
+WG_RUNTIME_DIR="$(mktemp -d)"
+WG_RUNTIME_CONF="$WG_RUNTIME_DIR/$(basename "$WG_CONFIG_PATH")"
+grep -Eiv '^[[:space:]]*DNS[[:space:]]*=' "$WG_CONFIG_PATH" > "$WG_RUNTIME_CONF"
+chmod 600 "$WG_RUNTIME_CONF"
+
+# Full-tunnel configs need this sysctl, which can only be set from outside
+# the container. Fail early with a clear message instead of mid-wg-quick.
+if grep -q '0\.0\.0\.0/0' "$WG_RUNTIME_CONF" && \
+   [ "$(cat /proc/sys/net/ipv4/conf/all/src_valid_mark 2>/dev/null)" != "1" ]; then
+    echo "ERROR: full-tunnel config requires the container to run with:" >&2
+    echo "  --sysctl net.ipv4.conf.all.src_valid_mark=1" >&2
+    exit 1
+fi
+
+echo "Bringing up WireGuard tunnel from $WG_RUNTIME_CONF (DNS lines stripped)..."
+wg-quick up "$WG_RUNTIME_CONF"
+wg show
+
+# cron starts jobs with an almost-empty environment, so snapshot the
+# container's env (SFTP_*, paths, ...) for the job to source at run time.
+export -p > /app/container.env
+chmod 600 /app/container.env
+
 # /proc/1/fd/1|2 sends the job's output to the container's stdout/stderr
 # so `docker logs` picks it up.
-echo "$SCHEDULE python3 /app/sync.py >> /proc/1/fd/1 2>> /proc/1/fd/2" | crontab -
+{
+    echo "SHELL=/bin/bash"
+    echo "$SCHEDULE . /app/container.env; python3 /app/sync.py >> /proc/1/fd/1 2>> /proc/1/fd/2"
+} | crontab -
 
 echo "Backup schedule installed: $SCHEDULE -> python3 /app/sync.py"
+
+# Initial run so the first backup doesn't wait for the schedule to come around.
+# A failure here is logged but doesn't kill the container; cron retries on schedule.
+echo "Running initial sync..."
+if python3 /app/sync.py; then
+    echo "Initial sync completed."
+else
+    echo "WARNING: initial sync failed with exit code $? - cron will retry on schedule." >&2
+fi
+
 echo "Starting cron in the foreground..."
 
 # Replace this script with the cron daemon (PID 1) so the container keeps running.

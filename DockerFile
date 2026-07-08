@@ -2,8 +2,13 @@ ARG PYTHON_VERSION=3.11
 FROM python:${PYTHON_VERSION}-slim
 
 RUN apt-get update && \
-    apt-get install -y wireguard-tools rsync iproute2 cron && \
+    apt-get install -y wireguard-tools rsync iproute2 cron procps && \
     rm -rf /var/lib/apt/lists/*
+
+# Docker mounts /proc/sys read-only, so wg-quick's unconditional sysctl write
+# fails even when the value is already correct (set via docker's --sysctl flag).
+# Patch it to skip the write when src_valid_mark is already 1.
+RUN sed -i 's#\[\[ $proto == -4 \]\] && cmd sysctl -q net.ipv4.conf.all.src_valid_mark=1#[[ $proto == -4 ]] \&\& { [[ $(sysctl -n net.ipv4.conf.all.src_valid_mark) == 1 ]] || cmd sysctl -q net.ipv4.conf.all.src_valid_mark=1; }#' /usr/bin/wg-quick
 
 RUN pip install paramiko
 
@@ -15,5 +20,9 @@ RUN chmod +x /entrypoint.sh
 # Default backup time: 03:00 every day. Override with -e BACKUP_SCHEDULE="..."
 # or by passing a cron expression as the container command.
 ENV BACKUP_SCHEDULE="0 3 * * *"
+
+# WireGuard config the entrypoint brings up at start. Mount your .conf here
+# (or point WG_CONFIG_PATH somewhere else).
+ENV WG_CONFIG_PATH="/etc/wireguard/wg0.conf"
 
 ENTRYPOINT ["/entrypoint.sh"]
