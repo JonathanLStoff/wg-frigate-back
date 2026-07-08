@@ -1,0 +1,19 @@
+ARG PYTHON_VERSION=3.11
+FROM python:${PYTHON_VERSION}-slim
+
+RUN apt-get update && \
+    apt-get install -y wireguard-tools rsync iproute2 cron && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN pip install paramiko
+
+WORKDIR /app
+COPY sync.py /app/sync.py
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Default backup time: 03:00 every day. Override with -e BACKUP_SCHEDULE="..."
+# or by passing a cron expression as the container command.
+ENV BACKUP_SCHEDULE="0 3 * * *"
+
+ENTRYPOINT ["/entrypoint.sh"]
