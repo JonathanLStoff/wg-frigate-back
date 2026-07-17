@@ -30,10 +30,11 @@ SFTP_PASSWORD = os.getenv("SFTP_PASSWORD", None)  # Set if not using key
 REMOTE_BASE_PATH = os.getenv("REMOTE_BASE_PATH", "/backup/frigate")  # Remote base directory
 DAYS_TO_KEEP = int(os.getenv("DAYS_TO_KEEP", 7))
 LOG_FILE = os.getenv("LOG_FILE", "/logs/sync.csv")  # Optional: log to a file
+DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 # --- END CONFIGURATION ---
 
 # Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO if not DEBUG else logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class FTPEntry:
@@ -153,41 +154,61 @@ class SMBAdapter:
         self.password = password
         self.smb_volume = smb_volume or "backup"
         self.base_path = f"//{host}/{self.smb_volume}"
+        logger.info(f"SMBAdapter: Connecting to {self.base_path}")
         # Register credentials for smbclient
         smbclient.register_session(host, username=username, password=password)
+        logger.info(f"SMBAdapter: Credentials registered for {host}")
 
     def stat(self, path):
         """Get file/directory stats (paramiko-style)."""
         try:
             full_path = f"{self.base_path}{path}"
+            logger.debug(f"SMB stat: {full_path}")
             stat_info = smbclient.stat(full_path)
             is_dir = (stat_info.st_mode & 0o170000) == 0o040000
             mode = S_IFDIR if is_dir else S_IFREG
             mtime = int(stat_info.st_mtime)
+            logger.debug(f"SMB stat OK: {path} (is_dir={is_dir})")
             return FTPEntry(os.path.basename(path), mode, mtime)
         except FileNotFoundError:
+            logger.debug(f"SMB stat FileNotFoundError: {path}")
             raise FileNotFoundError(path)
+        except Exception as e:
+            logger.error(f"SMB stat error for {path}: {type(e).__name__}: {e}")
+            raise
 
     def listdir_attr(self, path):
         """List directory contents with attributes."""
         try:
             full_path = f"{self.base_path}{path}"
+            logger.debug(f"SMB listdir_attr: {full_path}")
             entries = []
             for entry in smbclient.listdir_attr(full_path):
                 is_dir = (entry.st_mode & 0o170000) == 0o040000
                 mode = S_IFDIR if is_dir else S_IFREG
                 mtime = int(entry.st_mtime)
                 entries.append(FTPEntry(entry.name, mode, mtime))
+            logger.debug(f"SMB listdir_attr OK: {path} ({len(entries)} entries)")
             return entries
         except FileNotFoundError:
+            logger.debug(f"SMB listdir_attr FileNotFoundError: {path}")
             raise FileNotFoundError(path)
+        except Exception as e:
+            logger.error(f"SMB listdir_attr error for {path}: {type(e).__name__}: {e}")
+            raise
 
     def put(self, local_path, remote_path):
         """Upload a file."""
-        full_path = f"{self.base_path}{remote_path}"
-        with open(local_path, "rb") as local_file:
-            with smbclient.open_file(full_path, mode="wb") as remote_file:
-                remote_file.write(local_file.read())
+        try:
+            full_path = f"{self.base_path}{remote_path}"
+            logger.debug(f"SMB put: {local_path} -> {full_path}")
+            with open(local_path, "rb") as local_file:
+                with smbclient.open_file(full_path, mode="wb") as remote_file:
+                    remote_file.write(local_file.read())
+            logger.debug(f"SMB put OK: {remote_path}")
+        except Exception as e:
+            logger.error(f"SMB put error for {remote_path}: {type(e).__name__}: {e}")
+            raise
 
     def utime(self, path, times):
         """Set file modification time."""
@@ -202,23 +223,43 @@ class SMBAdapter:
         """Create a directory."""
         full_path = f"{self.base_path}{path}"
         try:
+            logger.debug(f"SMB mkdir: {full_path}")
             smbclient.mkdir(full_path)
-        except Exception:
-            pass  # Directory may already exist
+            logger.debug(f"SMB mkdir OK: {path}")
+        except FileExistsError:
+            logger.debug(f"SMB mkdir FileExistsError (OK): {path}")
+        except Exception as e:
+            logger.error(f"SMB mkdir error for {path}: {type(e).__name__}: {e}")
+            raise
 
     def rmdir(self, path):
         """Remove an empty directory."""
-        full_path = f"{self.base_path}{path}"
-        smbclient.rmdir(full_path)
+        try:
+            full_path = f"{self.base_path}{path}"
+            logger.debug(f"SMB rmdir: {full_path}")
+            smbclient.rmdir(full_path)
+            logger.debug(f"SMB rmdir OK: {path}")
+        except Exception as e:
+            logger.error(f"SMB rmdir error for {path}: {type(e).__name__}: {e}")
+            raise
 
     def remove(self, path):
-        """Delete a file."""
-        full_path = f"{self.base_path}{path}"
-        smbclient.remove(full_path)
+        """Remove a file."""
+        try:
+            full_path = f"{self.base_path}{path}"
+            logger.debug(f"SMB remove: {full_path}")
+            smbclient.remove(full_path)
+            logger.debug(f"SMB remove OK: {path}")
+        except Exception as e:
+            logger.error(f"SMB remove error for {path}: {type(e).__name__}: {e}")
+            raise
 
     def close(self):
         """Close the SMB session."""
-        pass  # smbclient manages connections automatically
+        try:
+            logger.debug("SMB session closing")
+        except Exception as e:
+            logger.warning(f"Error closing SMB session: {e}")
 
 def write_log(status, uploaded, removed, error=""):
     """Append one row per sync run to the CSV log, creating it (with header) if needed."""
@@ -271,12 +312,21 @@ def ensure_remote_dir(sftp, remote_dir):
     """Recursively create remote directories if they don't exist."""
     try:
         sftp.stat(remote_dir)
+        logger.debug(f"Remote directory exists: {remote_dir}")
     except FileNotFoundError:
+        logger.debug(f"Remote directory not found, creating: {remote_dir}")
         parent = os.path.dirname(remote_dir)
         if parent and parent != remote_dir:
             ensure_remote_dir(sftp, parent)
-        sftp.mkdir(remote_dir)
-        logger.debug(f"Created remote directory: {remote_dir}")
+        try:
+            sftp.mkdir(remote_dir)
+            logger.info(f"Created remote directory: {remote_dir}")
+        except Exception as e:
+            logger.error(f"Failed to create directory {remote_dir}: {e}")
+            raise
+    except Exception as e:
+        logger.error(f"Error checking/creating directory {remote_dir}: {e}")
+        raise
 
 def upload_file(sftp, local_path, remote_path):
     """Upload a single file, creating directories as needed."""
@@ -380,17 +430,28 @@ def sync_frigate_to_sftp():
         raise RuntimeError(f"{protocol} connection failed: {e}") from e
 
     try:
+        logger.info(f"Local recordings path: {LOCAL_RECORDINGS_PATH}")
+        logger.info(f"Remote base path: {REMOTE_BASE_PATH}")
+
         # Ensure remote base directory exists
+        logger.info("Ensuring remote base directory exists...")
         ensure_remote_dir(sftp, REMOTE_BASE_PATH)
+        logger.info("Remote base directory ready")
 
         # Walk local recordings directory
+        logger.info(f"Walking local directory: {LOCAL_RECORDINGS_PATH}")
         uploaded_count = 0
         failed_count = 0
+        total_files = 0
+
         for root, dirs, files in os.walk(LOCAL_RECORDINGS_PATH):
+            logger.debug(f"Scanning directory: {root} ({len(files)} files)")
+            total_files += len(files)
             for file in files:
                 local_path = os.path.join(root, file)
                 # Skip if file is older than cutoff
                 if not should_upload_file(local_path, cutoff):
+                    logger.debug(f"Skipping old file: {local_path}")
                     continue
 
                 # Build remote path preserving folder structure
@@ -407,14 +468,18 @@ def sync_frigate_to_sftp():
                         logger.debug(f"Skipping (up-to-date): {remote_path}")
                         continue
                 except FileNotFoundError:
-                    pass  # File doesn't exist remotely, upload it
+                    logger.debug(f"Remote file not found, will upload: {remote_path}")
+                except Exception as e:
+                    logger.error(f"Error checking remote file {remote_path}: {e}")
+                    failed_count += 1
+                    continue
 
                 if upload_file(sftp, local_path, remote_path):
                     uploaded_count += 1
                 else:
                     failed_count += 1
 
-        logger.info(f"Uploaded {uploaded_count} new/updated files.")
+        logger.info(f"Scanned {total_files} total files, uploaded {uploaded_count} new/updated files, {failed_count} failed.")
 
         # Cleanup remote files older than cutoff
         logger.info("Starting remote cleanup...")
@@ -423,15 +488,27 @@ def sync_frigate_to_sftp():
 
         return uploaded_count, failed_count, removed_count
 
+    except Exception as e:
+        logger.error(f"Fatal error during sync: {e}", exc_info=True)
+        raise
     finally:
-        sftp.close()
+        try:
+            sftp.close()
+            logger.debug("Closed remote connection")
+        except Exception as e:
+            logger.warning(f"Error closing connection: {e}")
         if ssh is not None:
-            ssh.close()
+            try:
+                ssh.close()
+                logger.debug("Closed SSH connection")
+            except Exception as e:
+                logger.warning(f"Error closing SSH: {e}")
 
 if __name__ == "__main__":
     try:
         uploaded, failed, removed = sync_frigate_to_sftp()
     except Exception as e:
+        logger.exception("Sync failed")
         write_log("failure", 0, 0, error=str(e))
         sys.exit(1)
 
