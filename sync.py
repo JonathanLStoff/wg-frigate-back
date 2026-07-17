@@ -163,17 +163,18 @@ class SMBAdapter:
         """Get file/directory stats (paramiko-style)."""
         try:
             full_path = f"{self.base_path}{path}"
-            logger.debug(f"SMB stat: {full_path}")
             stat_info = smbclient.stat(full_path)
             is_dir = (stat_info.st_mode & 0o170000) == 0o040000
             mode = S_IFDIR if is_dir else S_IFREG
             mtime = int(stat_info.st_mtime)
-            logger.debug(f"SMB stat OK: {path} (is_dir={is_dir})")
             return FTPEntry(os.path.basename(path), mode, mtime)
         except FileNotFoundError:
-            logger.debug(f"SMB stat FileNotFoundError: {path}")
             raise FileNotFoundError(path)
         except Exception as e:
+            # Convert "file not found" errors to FileNotFoundError
+            error_str = str(e).lower()
+            if "no such file" in error_str or "not found" in error_str:
+                raise FileNotFoundError(path) from e
             logger.error(f"SMB stat error for {path}: {type(e).__name__}: {e}")
             raise
 
@@ -181,14 +182,13 @@ class SMBAdapter:
         """List directory contents with attributes."""
         try:
             full_path = f"{self.base_path}{path}"
-            logger.debug(f"SMB listdir_attr: {full_path}")
             entries = []
             for entry in smbclient.listdir_attr(full_path):
                 is_dir = (entry.st_mode & 0o170000) == 0o040000
                 mode = S_IFDIR if is_dir else S_IFREG
                 mtime = int(entry.st_mtime)
                 entries.append(FTPEntry(entry.name, mode, mtime))
-            logger.debug(f"SMB listdir_attr OK: {path} ({len(entries)} entries)")
+            logger.debug(f"SMB listdir: {path} found {len(entries)} entries")
             return entries
         except FileNotFoundError:
             logger.debug(f"SMB listdir_attr FileNotFoundError: {path}")
@@ -199,16 +199,10 @@ class SMBAdapter:
 
     def put(self, local_path, remote_path):
         """Upload a file."""
-        try:
-            full_path = f"{self.base_path}{remote_path}"
-            logger.debug(f"SMB put: {local_path} -> {full_path}")
-            with open(local_path, "rb") as local_file:
-                with smbclient.open_file(full_path, mode="wb") as remote_file:
-                    remote_file.write(local_file.read())
-            logger.debug(f"SMB put OK: {remote_path}")
-        except Exception as e:
-            logger.error(f"SMB put error for {remote_path}: {type(e).__name__}: {e}")
-            raise
+        full_path = f"{self.base_path}{remote_path}"
+        with open(local_path, "rb") as local_file:
+            with smbclient.open_file(full_path, mode="wb") as remote_file:
+                remote_file.write(local_file.read())
 
     def utime(self, path, times):
         """Set file modification time."""
@@ -223,36 +217,25 @@ class SMBAdapter:
         """Create a directory."""
         full_path = f"{self.base_path}{path}"
         try:
-            logger.debug(f"SMB mkdir: {full_path}")
             smbclient.mkdir(full_path)
-            logger.debug(f"SMB mkdir OK: {path}")
         except FileExistsError:
-            logger.debug(f"SMB mkdir FileExistsError (OK): {path}")
+            pass  # Directory already exists
         except Exception as e:
+            # Handle "already exists" errors gracefully
+            if "exists" in str(e).lower():
+                return
             logger.error(f"SMB mkdir error for {path}: {type(e).__name__}: {e}")
             raise
 
     def rmdir(self, path):
         """Remove an empty directory."""
-        try:
-            full_path = f"{self.base_path}{path}"
-            logger.debug(f"SMB rmdir: {full_path}")
-            smbclient.rmdir(full_path)
-            logger.debug(f"SMB rmdir OK: {path}")
-        except Exception as e:
-            logger.error(f"SMB rmdir error for {path}: {type(e).__name__}: {e}")
-            raise
+        full_path = f"{self.base_path}{path}"
+        smbclient.rmdir(full_path)
 
     def remove(self, path):
         """Remove a file."""
-        try:
-            full_path = f"{self.base_path}{path}"
-            logger.debug(f"SMB remove: {full_path}")
-            smbclient.remove(full_path)
-            logger.debug(f"SMB remove OK: {path}")
-        except Exception as e:
-            logger.error(f"SMB remove error for {path}: {type(e).__name__}: {e}")
-            raise
+        full_path = f"{self.base_path}{path}"
+        smbclient.remove(full_path)
 
     def close(self):
         """Close the SMB session."""
@@ -467,12 +450,11 @@ def sync_frigate_to_sftp():
                     if remote_mtime >= local_mtime:
                         logger.debug(f"Skipping (up-to-date): {remote_path}")
                         continue
-                except FileNotFoundError:
-                    logger.debug(f"Remote file not found, will upload: {remote_path}")
-                except Exception as e:
-                    logger.error(f"Error checking remote file {remote_path}: {e}")
-                    failed_count += 1
-                    continue
+                except Exception:
+                    # If stat fails (file not found or any error), we'll try to upload
+                    # This is faster than checking every file - let upload handle errors
+                    logger.debug(f"Remote file check failed (will attempt upload): {remote_path}")
+                    pass
 
                 if upload_file(sftp, local_path, remote_path):
                     uploaded_count += 1

@@ -96,10 +96,12 @@ Notes:
 - **SMB mode** (`USE_SMB=true`): uploads to a Samba/SMB share. Reuses the same
   `SFTP_HOST` (hostname or IP), `SFTP_USERNAME`, and `SFTP_PASSWORD` variables
   for authentication. `SMB_VOLUME` specifies the shared folder name (e.g.,
-  "backup" for `//server/backup`). `SFTP_PRIVATE_KEY_PATH` is ignored in SMB
-  mode; password authentication is required. All traffic rides the WireGuard
-  tunnel, staying encrypted end to end. SMB preserves the directory structure
-  like SFTP.
+  "backup" for `//server/backup`). **Important:** `REMOTE_BASE_PATH` must be
+  relative to the share root — e.g., `/backup/frigate` not `/home/user/backup`.
+  The share's root (e.g., `//server/backup`) is where the share is mounted on
+  the server; paths inside it are relative to that. `SFTP_PRIVATE_KEY_PATH` is
+  ignored in SMB mode; password authentication is required. All traffic rides
+  the WireGuard tunnel, staying encrypted end to end.
 
 ## Running
 
