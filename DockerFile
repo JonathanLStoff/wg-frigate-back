@@ -10,7 +10,7 @@ RUN apt-get update && \
 # Patch it to skip the write when src_valid_mark is already 1.
 RUN sed -i 's#\[\[ $proto == -4 \]\] && cmd sysctl -q net.ipv4.conf.all.src_valid_mark=1#[[ $proto == -4 ]] \&\& { [[ $(sysctl -n net.ipv4.conf.all.src_valid_mark) == 1 ]] || cmd sysctl -q net.ipv4.conf.all.src_valid_mark=1; }#' /usr/bin/wg-quick
 
-RUN pip install paramiko smbclient
+RUN pip install paramiko smbprotocol
 
 WORKDIR /app
 COPY sync.py /app/sync.py

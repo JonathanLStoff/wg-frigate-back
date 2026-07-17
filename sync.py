@@ -141,17 +141,17 @@ class FTPAdapter:
 
 class SMBAdapter:
     """
-    Wraps smbclient with a paramiko-style SFTPClient API subset.
+    Wraps smbprotocol's smbclient with a paramiko-style SFTPClient API subset.
     Reuses SFTP credentials (host, username, password) for SMB authentication.
     """
 
     def __init__(self, host, username, password, smb_volume):
         if smbclient is None:
-            raise ImportError("smbclient is not installed. Install it with: pip install smbclient")
+            raise ImportError("smbprotocol is not installed. Install it with: pip install smbprotocol")
         self.host = host
         self.username = username
         self.password = password
-        self.smb_volume = smb_volume or "backup"  # Default volume if not specified
+        self.smb_volume = smb_volume or "backup"
         self.base_path = f"//{host}/{self.smb_volume}"
         # Register credentials for smbclient
         smbclient.register_session(host, username=username, password=password)
@@ -163,7 +163,7 @@ class SMBAdapter:
             stat_info = smbclient.stat(full_path)
             is_dir = (stat_info.st_mode & 0o170000) == 0o040000
             mode = S_IFDIR if is_dir else S_IFREG
-            mtime = stat_info.st_mtime
+            mtime = int(stat_info.st_mtime)
             return FTPEntry(os.path.basename(path), mode, mtime)
         except FileNotFoundError:
             raise FileNotFoundError(path)
@@ -176,8 +176,8 @@ class SMBAdapter:
             for entry in smbclient.listdir_attr(full_path):
                 is_dir = (entry.st_mode & 0o170000) == 0o040000
                 mode = S_IFDIR if is_dir else S_IFREG
-                mtime = entry.st_mtime
-                entries.append(FTPEntry(entry.filename, mode, mtime))
+                mtime = int(entry.st_mtime)
+                entries.append(FTPEntry(entry.name, mode, mtime))
             return entries
         except FileNotFoundError:
             raise FileNotFoundError(path)
@@ -194,7 +194,6 @@ class SMBAdapter:
         try:
             full_path = f"{self.base_path}{path}"
             smbclient.stat(full_path)  # Verify file exists
-            # smbclient doesn't have direct utime, so we note this limitation
             logger.debug(f"SMB: cannot preserve mtime for {path}, using transfer time instead")
         except Exception as e:
             logger.warning(f"Could not set mtime for {path}: {e}")
@@ -204,8 +203,8 @@ class SMBAdapter:
         full_path = f"{self.base_path}{path}"
         try:
             smbclient.mkdir(full_path)
-        except FileExistsError:
-            pass  # Directory already exists
+        except Exception:
+            pass  # Directory may already exist
 
     def rmdir(self, path):
         """Remove an empty directory."""
@@ -219,10 +218,7 @@ class SMBAdapter:
 
     def close(self):
         """Close the SMB session."""
-        try:
-            smbclient.reset_connection_cache()
-        except Exception:
-            pass
+        pass  # smbclient manages connections automatically
 
 def write_log(status, uploaded, removed, error=""):
     """Append one row per sync run to the CSV log, creating it (with header) if needed."""
