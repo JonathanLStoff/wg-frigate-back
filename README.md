@@ -1,7 +1,7 @@
 # wg-frigate-back
 
 Dockerized backup for Frigate recordings: brings up a WireGuard tunnel, then
-syncs recordings to an SFTP host on a cron schedule (with an initial sync at
+syncs recordings to an SFTP, FTP, or SMB host on a cron schedule (with an initial sync at
 container start).
 
 ## How it works
@@ -60,7 +60,8 @@ everything else. Use an IP for `SFTP_HOST` if DNS privacy matters.
 ## Environment variables
 
 REQUIRED OS VARS:
-```
+
+```bash
 WG_CONFIG_PATH=/path/to/wg0.conf
 LOCAL_RECORDINGS_PATH=/path/to/frigate/recordings
 SFTP_HOST=sftp.example.com
@@ -73,6 +74,8 @@ DAYS_TO_KEEP=7
 BACKUP_SCHEDULE=0 0 * * *  # Cron schedule for backup (default: daily at midnight)
 LOG_FILE=/logs/sync.csv  # CSV run log: timestamp, success/failure, files uploaded/removed, error info
 USE_FTP=false  # Set to true to upload over plain FTP instead of SFTP
+USE_SMB=false  # Set to true to upload over SMB/Samba instead of SFTP
+SMB_VOLUME=backup  # SMB shared volume/folder name (required if USE_SMB=true)
 ```
 
 Notes:
@@ -90,6 +93,13 @@ Notes:
   encrypted on the wire end to end. If the FTP server doesn't support the
   `MFMT` command, uploaded files keep their upload time as mtime, so the
   `DAYS_TO_KEEP` retention counts from upload day instead of recording day.
+- **SMB mode** (`USE_SMB=true`): uploads to a Samba/SMB share. Reuses the same
+  `SFTP_HOST` (hostname or IP), `SFTP_USERNAME`, and `SFTP_PASSWORD` variables
+  for authentication. `SMB_VOLUME` specifies the shared folder name (e.g.,
+  "backup" for `//server/backup`). `SFTP_PRIVATE_KEY_PATH` is ignored in SMB
+  mode; password authentication is required. All traffic rides the WireGuard
+  tunnel, staying encrypted end to end. SMB preserves the directory structure
+  like SFTP.
 
 ## Running
 
@@ -117,6 +127,11 @@ docker run -d \
 
 Using a password instead of a key: drop the key mount and
 `SFTP_PRIVATE_KEY_PATH`, and set `-e SFTP_PASSWORD=your-password`.
+
+To use SMB instead: set `-e USE_SMB=true -e SMB_VOLUME=backup` (where `backup`
+is your shared folder name), and keep `SFTP_HOST`, `SFTP_USERNAME`, and
+`SFTP_PASSWORD` — they're reused for SMB authentication. You can drop the key
+mount and `SFTP_PRIVATE_KEY_PATH` since SMB uses password auth.
 
 Or with docker compose:
 

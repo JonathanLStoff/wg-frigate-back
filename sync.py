@@ -12,10 +12,16 @@ import time
 from datetime import datetime, timedelta, timezone
 from stat import S_ISDIR, S_IFDIR, S_IFREG
 import logging
+try:
+    import smbclient
+except ImportError:
+    smbclient = None
 
 # --- CONFIGURATION ---
 LOCAL_RECORDINGS_PATH = os.getenv("LOCAL_RECORDINGS_PATH", "/media/frigate/recordings")  # Path to your Frigate recordings
 USE_FTP = os.getenv("USE_FTP", "false").lower() == "true"  # Optional: use FTP instead of SFTP
+USE_SMB = os.getenv("USE_SMB", "false").lower() == "true"  # Optional: use SMB instead of SFTP
+SMB_VOLUME = os.getenv("SMB_VOLUME", None)  # Optional: SMB volume name if using SMB
 SFTP_HOST = os.getenv("SFTP_HOST", "sftp.example.com")  # SFTP server hostname
 SFTP_PORT = int(os.getenv("SFTP_PORT", 21 if USE_FTP else 22))
 SFTP_USERNAME = os.getenv("SFTP_USERNAME", "your-username")
@@ -132,6 +138,91 @@ class FTPAdapter:
             self._ftp.quit()
         except Exception:
             self._ftp.close()
+
+class SMBAdapter:
+    """
+    Wraps smbclient with a paramiko-style SFTPClient API subset.
+    Reuses SFTP credentials (host, username, password) for SMB authentication.
+    """
+
+    def __init__(self, host, username, password, smb_volume):
+        if smbclient is None:
+            raise ImportError("smbclient is not installed. Install it with: pip install smbclient")
+        self.host = host
+        self.username = username
+        self.password = password
+        self.smb_volume = smb_volume or "backup"  # Default volume if not specified
+        self.base_path = f"//{host}/{self.smb_volume}"
+        # Register credentials for smbclient
+        smbclient.register_session(host, username=username, password=password)
+
+    def stat(self, path):
+        """Get file/directory stats (paramiko-style)."""
+        try:
+            full_path = f"{self.base_path}{path}"
+            stat_info = smbclient.stat(full_path)
+            is_dir = (stat_info.st_mode & 0o170000) == 0o040000
+            mode = S_IFDIR if is_dir else S_IFREG
+            mtime = stat_info.st_mtime
+            return FTPEntry(os.path.basename(path), mode, mtime)
+        except FileNotFoundError:
+            raise FileNotFoundError(path)
+
+    def listdir_attr(self, path):
+        """List directory contents with attributes."""
+        try:
+            full_path = f"{self.base_path}{path}"
+            entries = []
+            for entry in smbclient.listdir_attr(full_path):
+                is_dir = (entry.st_mode & 0o170000) == 0o040000
+                mode = S_IFDIR if is_dir else S_IFREG
+                mtime = entry.st_mtime
+                entries.append(FTPEntry(entry.filename, mode, mtime))
+            return entries
+        except FileNotFoundError:
+            raise FileNotFoundError(path)
+
+    def put(self, local_path, remote_path):
+        """Upload a file."""
+        full_path = f"{self.base_path}{remote_path}"
+        with open(local_path, "rb") as local_file:
+            with smbclient.open_file(full_path, mode="wb") as remote_file:
+                remote_file.write(local_file.read())
+
+    def utime(self, path, times):
+        """Set file modification time."""
+        try:
+            full_path = f"{self.base_path}{path}"
+            smbclient.stat(full_path)  # Verify file exists
+            # smbclient doesn't have direct utime, so we note this limitation
+            logger.debug(f"SMB: cannot preserve mtime for {path}, using transfer time instead")
+        except Exception as e:
+            logger.warning(f"Could not set mtime for {path}: {e}")
+
+    def mkdir(self, path):
+        """Create a directory."""
+        full_path = f"{self.base_path}{path}"
+        try:
+            smbclient.mkdir(full_path)
+        except FileExistsError:
+            pass  # Directory already exists
+
+    def rmdir(self, path):
+        """Remove an empty directory."""
+        full_path = f"{self.base_path}{path}"
+        smbclient.rmdir(full_path)
+
+    def remove(self, path):
+        """Delete a file."""
+        full_path = f"{self.base_path}{path}"
+        smbclient.remove(full_path)
+
+    def close(self):
+        """Close the SMB session."""
+        try:
+            smbclient.reset_connection_cache()
+        except Exception:
+            pass
 
 def write_log(status, uploaded, removed, error=""):
     """Append one row per sync run to the CSV log, creating it (with header) if needed."""
@@ -254,11 +345,23 @@ def sync_frigate_to_sftp():
     cutoff = get_cutoff_time(DAYS_TO_KEEP)
     logger.info(f"Syncing files newer than: {cutoff.isoformat()}")
 
-    # Connect to the remote server (FTP or SFTP)
+    # Connect to the remote server (FTP, SFTP, or SMB)
     ssh = None
-    protocol = "FTP" if USE_FTP else "SFTP"
+    if USE_SMB:
+        protocol = "SMB"
+    elif USE_FTP:
+        protocol = "FTP"
+    else:
+        protocol = "SFTP"
+
     try:
-        if USE_FTP:
+        if USE_SMB:
+            if not SFTP_PASSWORD:
+                raise ValueError("SMB mode requires SFTP_PASSWORD for authentication.")
+            if not SMB_VOLUME:
+                raise ValueError("SMB mode requires SMB_VOLUME to be set.")
+            sftp = SMBAdapter(SFTP_HOST, SFTP_USERNAME, SFTP_PASSWORD, SMB_VOLUME)
+        elif USE_FTP:
             if not SFTP_PASSWORD:
                 raise ValueError("FTP mode requires SFTP_PASSWORD (key auth is SFTP-only).")
             sftp = FTPAdapter(SFTP_HOST, SFTP_PORT, SFTP_USERNAME, SFTP_PASSWORD)
