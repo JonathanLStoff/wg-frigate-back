@@ -8,7 +8,9 @@ import ftplib
 import os
 import sys
 import paramiko
+import tempfile
 import time
+import zipfile
 from datetime import datetime, timedelta, timezone
 from stat import S_ISDIR, S_IFDIR, S_IFREG
 import logging
@@ -28,7 +30,7 @@ SFTP_USERNAME = os.getenv("SFTP_USERNAME", "your-username")
 SFTP_PRIVATE_KEY_PATH = os.getenv("SFTP_PRIVATE_KEY_PATH", None)  # or use password
 SFTP_PASSWORD = os.getenv("SFTP_PASSWORD", None)  # Set if not using key
 REMOTE_BASE_PATH = os.getenv("REMOTE_BASE_PATH", "/backup/frigate")  # Remote base directory
-DAYS_TO_KEEP = int(os.getenv("DAYS_TO_KEEP", 7))
+DAYS_TO_KEEP = int(os.getenv("DAYS_TO_KEEP", 2))
 LOG_FILE = os.getenv("LOG_FILE", "/logs/sync.csv")  # Optional: log to a file
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 # --- END CONFIGURATION ---
@@ -311,15 +313,23 @@ def ensure_remote_dir(sftp, remote_dir):
         logger.error(f"Error checking/creating directory {remote_dir}: {e}")
         raise
 
-def upload_file(sftp, local_path, remote_path):
+def compress_file(local_path):
+    """Compress a single local file into a temporary zip archive and return its path."""
+    fd, zip_path = tempfile.mkstemp(suffix=".zip")
+    os.close(fd)
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.write(local_path, arcname=os.path.basename(local_path))
+    return zip_path
+
+def upload_file(sftp, local_path, remote_path, mtime=None):
     """Upload a single file, creating directories as needed."""
     try:
         remote_dir = os.path.dirname(remote_path)
         ensure_remote_dir(sftp, remote_dir)
         sftp.put(local_path, remote_path)
-        # Preserve the local mtime so "already copied" checks and remote
-        # cleanup work off the recording time, not the upload time.
-        local_mtime = int(os.path.getmtime(local_path))
+        # Preserve the original recording's mtime so "already copied" checks and
+        # remote cleanup work off the recording time, not the upload time.
+        local_mtime = int(mtime if mtime is not None else os.path.getmtime(local_path))
         sftp.utime(remote_path, (local_mtime, local_mtime))
         logger.info(f"Uploaded: {local_path} -> {remote_path}")
         return True
@@ -421,6 +431,12 @@ def sync_frigate_to_sftp():
         ensure_remote_dir(sftp, REMOTE_BASE_PATH)
         logger.info("Remote base directory ready")
 
+        # Cleanup remote files older than cutoff first, so stale recordings are
+        # purged before we spend time/bandwidth uploading new ones.
+        logger.info("Starting remote cleanup...")
+        removed_count = cleanup_remote(sftp, REMOTE_BASE_PATH, cutoff)
+        logger.info(f"Remote cleanup complete. Removed {removed_count} old files.")
+
         # Walk local recordings directory
         logger.info(f"Walking local directory: {LOCAL_RECORDINGS_PATH}")
         uploaded_count = 0
@@ -437,15 +453,16 @@ def sync_frigate_to_sftp():
                     logger.debug(f"Skipping old file: {local_path}")
                     continue
 
-                # Build remote path preserving folder structure
+                # Build remote path preserving folder structure; files are
+                # zip-compressed before upload, so the remote name gets a .zip suffix
                 rel_path = os.path.relpath(local_path, LOCAL_RECORDINGS_PATH)
-                remote_path = os.path.join(REMOTE_BASE_PATH, rel_path).replace("\\", "/")
+                remote_path = os.path.join(REMOTE_BASE_PATH, rel_path).replace("\\", "/") + ".zip"
+                local_mtime = os.path.getmtime(local_path)
 
                 # Check if file already exists remotely and is up-to-date
                 try:
                     remote_attr = sftp.stat(remote_path)
                     remote_mtime = remote_attr.st_mtime
-                    local_mtime = os.path.getmtime(local_path)
                     # If remote file is newer or same age, skip
                     if remote_mtime >= local_mtime:
                         logger.debug(f"Skipping (up-to-date): {remote_path}")
@@ -456,17 +473,16 @@ def sync_frigate_to_sftp():
                     logger.debug(f"Remote file check failed (will attempt upload): {remote_path}")
                     pass
 
-                if upload_file(sftp, local_path, remote_path):
-                    uploaded_count += 1
-                else:
-                    failed_count += 1
+                zip_path = compress_file(local_path)
+                try:
+                    if upload_file(sftp, zip_path, remote_path, mtime=local_mtime):
+                        uploaded_count += 1
+                    else:
+                        failed_count += 1
+                finally:
+                    os.remove(zip_path)
 
         logger.info(f"Scanned {total_files} total files, uploaded {uploaded_count} new/updated files, {failed_count} failed.")
-
-        # Cleanup remote files older than cutoff
-        logger.info("Starting remote cleanup...")
-        removed_count = cleanup_remote(sftp, REMOTE_BASE_PATH, cutoff)
-        logger.info(f"Remote cleanup complete. Removed {removed_count} old files.")
 
         return uploaded_count, failed_count, removed_count
 
