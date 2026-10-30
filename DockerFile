@@ -15,7 +15,8 @@ RUN pip install paramiko smbprotocol
 WORKDIR /app
 COPY sync.py /app/sync.py
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+COPY healthcheck.sh /healthcheck.sh
+RUN chmod +x /entrypoint.sh /healthcheck.sh
 
 # Default backup time: 03:00 every day. Override with -e BACKUP_SCHEDULE="..."
 # or by passing a cron expression as the container command.
@@ -24,5 +25,8 @@ ENV BACKUP_SCHEDULE="0 3 * * *"
 # WireGuard config the entrypoint brings up at start. Mount your .conf here
 # (or point WG_CONFIG_PATH somewhere else).
 ENV WG_CONFIG_PATH="/etc/wireguard/wg0.conf"
+
+HEALTHCHECK --interval=5m --timeout=15s --start-period=1m --retries=3 \
+    CMD /healthcheck.sh || exit 1
 
 ENTRYPOINT ["/entrypoint.sh"]

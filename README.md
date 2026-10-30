@@ -96,12 +96,27 @@ Notes:
 - **SMB mode** (`USE_SMB=true`): uploads to a Samba/SMB share. Reuses the same
   `SFTP_HOST` (hostname or IP), `SFTP_USERNAME`, and `SFTP_PASSWORD` variables
   for authentication. `SMB_VOLUME` specifies the shared folder name (e.g.,
-  "backup" for `//server/backup`). **Important:** `REMOTE_BASE_PATH` must be
-  relative to the share root — e.g., `/backup/frigate` not `/home/user/backup`.
-  The share's root (e.g., `//server/backup`) is where the share is mounted on
-  the server; paths inside it are relative to that. `SFTP_PRIVATE_KEY_PATH` is
-  ignored in SMB mode; password authentication is required. All traffic rides
-  the WireGuard tunnel, staying encrypted end to end.
+  "backup" for `//server/backup`).
+  
+  > [!CAUTION]
+  > **CRITICAL SAFETY REQUIREMENT: NEVER SET `REMOTE_BASE_PATH=/`**
+  >
+  > `REMOTE_BASE_PATH` must be a **dedicated subfolder** on the target share
+  > (e.g. `/frigate_backup`). The retention cleanup routine recursively scans
+  > `REMOTE_BASE_PATH` and deletes any file older than `DAYS_TO_KEEP` and prunes
+  > empty directories. If `REMOTE_BASE_PATH` is set to `/`, cleanup will scan the
+  > **entire share root** and delete non-Frigate files (such as other service
+  > directories like `mqtt/`). The script will refuse to start if `REMOTE_BASE_PATH`
+  > is set to `/` or empty.
+
+  Optional SMB tuning variables:
+  - `SMB_PORT`: SMB port (default: 445).
+  - `SMB_TIMEOUT`: SMB connection timeout in seconds (default: 30).
+  - `CONNECT_RETRIES`: Number of connection attempts before failing (default: 3).
+  - `CONNECT_RETRY_DELAY`: Seconds between connection attempts (default: 5).
+  
+  `SFTP_PRIVATE_KEY_PATH` is ignored in SMB mode; password authentication is
+  required. All traffic rides the WireGuard tunnel, staying encrypted end to end.
 
 ## Running
 

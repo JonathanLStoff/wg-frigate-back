@@ -1,43 +1,84 @@
 #!/usr/bin/env python3
 """
-Frigate Backup Script - Uploads last 7 days of recordings to an SFTP (or FTP) server.
+Frigate Backup Script - Uploads recordings to an SFTP, FTP, or SMB server.
 """
 
 import csv
+import errno
 import ftplib
+import logging
 import os
+import shutil
 import sys
-import paramiko
 import tempfile
 import time
 import zipfile
 from datetime import datetime, timedelta, timezone
 from stat import S_ISDIR, S_IFDIR, S_IFREG
-import logging
+import paramiko
+
 try:
     import smbclient
+    from smbprotocol.exceptions import SMBOSError
 except ImportError:
     smbclient = None
+    SMBOSError = None
 
 # --- CONFIGURATION ---
 LOCAL_RECORDINGS_PATH = os.getenv("LOCAL_RECORDINGS_PATH", "/media/frigate/recordings")  # Path to your Frigate recordings
 USE_FTP = os.getenv("USE_FTP", "false").lower() == "true"  # Optional: use FTP instead of SFTP
 USE_SMB = os.getenv("USE_SMB", "false").lower() == "true"  # Optional: use SMB instead of SFTP
-SMB_VOLUME = os.getenv("SMB_VOLUME", None)  # Optional: SMB volume name if using SMB
-SFTP_HOST = os.getenv("SFTP_HOST", "sftp.example.com")  # SFTP server hostname
-SFTP_PORT = int(os.getenv("SFTP_PORT", 21 if USE_FTP else 22))
+SMB_VOLUME = os.getenv("SMB_VOLUME", None)  # Required if USE_SMB=true (e.g. 'backup')
+SFTP_HOST = os.getenv("SFTP_HOST", "sftp.example.com")  # Remote server hostname or IP
+SFTP_PORT = int(os.getenv("SFTP_PORT", 21 if USE_FTP else (445 if USE_SMB else 22)))
+SMB_PORT = int(os.getenv("SMB_PORT", str(SFTP_PORT) if USE_SMB else "445"))
+SMB_TIMEOUT = int(os.getenv("SMB_TIMEOUT", "30"))
+CONNECT_RETRIES = int(os.getenv("CONNECT_RETRIES", "3"))
+CONNECT_RETRY_DELAY = int(os.getenv("CONNECT_RETRY_DELAY", "5"))
 SFTP_USERNAME = os.getenv("SFTP_USERNAME", "your-username")
 SFTP_PRIVATE_KEY_PATH = os.getenv("SFTP_PRIVATE_KEY_PATH", None)  # or use password
 SFTP_PASSWORD = os.getenv("SFTP_PASSWORD", None)  # Set if not using key
-REMOTE_BASE_PATH = os.getenv("REMOTE_BASE_PATH", "/backup/frigate")  # Remote base directory
-DAYS_TO_KEEP = int(os.getenv("DAYS_TO_KEEP", 2))
+REMOTE_BASE_PATH = os.getenv("REMOTE_BASE_PATH", "/backup/frigate")  # Remote base directory (must be a dedicated subfolder)
+DAYS_TO_KEEP = int(os.getenv("DAYS_TO_KEEP", 7))
 LOG_FILE = os.getenv("LOG_FILE", "/logs/sync.csv")  # Optional: log to a file
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 # --- END CONFIGURATION ---
 
 # Setup logging
-logging.basicConfig(level=logging.INFO if not DEBUG else logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO if not DEBUG else logging.DEBUG,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
 logger = logging.getLogger(__name__)
+
+
+def _is_not_found(e: Exception) -> bool:
+    """Check if an exception indicates a file or directory was not found (including SMBOSError)."""
+    if isinstance(e, FileNotFoundError):
+        return True
+    if isinstance(e, OSError) and getattr(e, "errno", None) == errno.ENOENT:
+        return True
+    ntstatus = getattr(e, "ntstatus", None)
+    # 0xC0000034: STATUS_OBJECT_NAME_NOT_FOUND, 0xC000003A: STATUS_OBJECT_PATH_NOT_FOUND
+    if ntstatus in (0xC0000034, 0xC000003A):
+        return True
+    msg = str(e).lower()
+    return any(term in msg for term in ("0xc0000034", "0xc000003a", "not found", "no such file"))
+
+
+def _is_already_exists(e: Exception) -> bool:
+    """Check if an exception indicates a directory/file already exists (including SMBOSError)."""
+    if isinstance(e, FileExistsError):
+        return True
+    if isinstance(e, OSError) and getattr(e, "errno", None) == errno.EEXIST:
+        return True
+    ntstatus = getattr(e, "ntstatus", None)
+    # 0xC0000035: STATUS_OBJECT_NAME_COLLISION
+    if ntstatus == 0xC0000035:
+        return True
+    msg = str(e).lower()
+    return any(term in msg for term in ("0xc0000035", "already exists", "file exists"))
+
 
 class FTPEntry:
     """Directory entry with the attributes cleanup/sync code reads (paramiko-style)."""
@@ -45,6 +86,7 @@ class FTPEntry:
         self.filename = filename
         self.st_mode = st_mode
         self.st_mtime = st_mtime
+
 
 class FTPAdapter:
     """
@@ -142,109 +184,183 @@ class FTPAdapter:
         except Exception:
             self._ftp.close()
 
+
 class SMBAdapter:
     """
     Wraps smbprotocol's smbclient with a paramiko-style SFTPClient API subset.
     Reuses SFTP credentials (host, username, password) for SMB authentication.
     """
 
-    def __init__(self, host, username, password, smb_volume):
+    def __init__(self, host, username, password, smb_volume, port=445, timeout=30, retries=3, retry_delay=5):
         if smbclient is None:
             raise ImportError("smbprotocol is not installed. Install it with: pip install smbprotocol")
         self.host = host
         self.username = username
         self.password = password
-        self.smb_volume = smb_volume or "backup"
-        self.base_path = f"//{host}/{self.smb_volume}"
-        logger.info(f"SMBAdapter: Connecting to {self.base_path}")
-        # Register credentials for smbclient
-        smbclient.register_session(host, username=username, password=password)
-        logger.info(f"SMBAdapter: Credentials registered for {host}")
+        self.smb_volume = (smb_volume or "backup").replace("/", "\\").strip("\\")
+        self.port = port
+        self.timeout = timeout
+        self.base_path = f"\\\\{self.host}\\{self.smb_volume}"
 
-    def stat(self, path):
+        logger.info(f"SMBAdapter: Registering session for {self.base_path} (port {self.port}, timeout {self.timeout}s)")
+        smbclient.register_session(
+            self.host,
+            username=self.username,
+            password=self.password,
+            port=self.port,
+            connection_timeout=self.timeout,
+        )
+        logger.info(f"SMBAdapter: Credentials registered for {self.host}")
+
+        # Verify connection with retries to tolerate slow WireGuard handshakes or transient network drops
+        last_err = None
+        for attempt in range(1, retries + 1):
+            try:
+                logger.info(f"SMBAdapter: Verifying connection to {self.base_path} (attempt {attempt}/{retries})...")
+                smbclient.stat(self.base_path)
+                logger.info(f"SMBAdapter: Successfully connected to {self.base_path}")
+                return
+            except Exception as e:
+                last_err = e
+                if _is_not_found(e):
+                    # Server responded, even if share root stat varies across SMB server implementations
+                    logger.info(f"SMBAdapter: Share {self.base_path} responded.")
+                    return
+                logger.warning(f"SMBAdapter: Connection attempt {attempt}/{retries} failed: {e}")
+                if attempt < retries:
+                    try:
+                        smbclient.reset_connection_cache()
+                    except Exception:
+                        pass
+                    time.sleep(retry_delay * attempt)
+                    try:
+                        smbclient.register_session(
+                            self.host,
+                            username=self.username,
+                            password=self.password,
+                            port=self.port,
+                            connection_timeout=self.timeout,
+                        )
+                    except Exception:
+                        pass
+
+        if last_err is not None:
+            logger.error(f"SMBAdapter: All {retries} connection attempts to {self.base_path} failed: {last_err}")
+            raise last_err
+
+    def _full_path(self, path: str) -> str:
+        """Convert a relative or absolute remote path into a valid UNC path \\\\host\\share\\rel."""
+        if not path:
+            return self.base_path
+        rel = path.replace("/", "\\").strip("\\")
+        if not rel or rel == ".":
+            return self.base_path
+        return f"{self.base_path}\\{rel}"
+
+    def stat(self, path: str) -> FTPEntry:
         """Get file/directory stats (paramiko-style)."""
+        full_path = self._full_path(path)
         try:
-            full_path = f"{self.base_path}{path}"
             stat_info = smbclient.stat(full_path)
-            is_dir = (stat_info.st_mode & 0o170000) == 0o040000
-            mode = S_IFDIR if is_dir else S_IFREG
+            mode = S_IFDIR if (stat_info.st_mode & 0o170000) == 0o040000 else S_IFREG
             mtime = int(stat_info.st_mtime)
-            return FTPEntry(os.path.basename(path), mode, mtime)
-        except FileNotFoundError:
-            raise FileNotFoundError(path)
+            basename = os.path.basename(path.replace("\\", "/").rstrip("/"))
+            return FTPEntry(basename, mode, mtime)
         except Exception as e:
-            # Convert "file not found" errors to FileNotFoundError
-            error_str = str(e).lower()
-            if "no such file" in error_str or "not found" in error_str:
+            if _is_not_found(e):
                 raise FileNotFoundError(path) from e
-            logger.error(f"SMB stat error for {path}: {type(e).__name__}: {e}")
+            logger.error(f"SMB stat error for {path} ({full_path}): {type(e).__name__}: {e}")
             raise
 
-    def listdir_attr(self, path):
-        """List directory contents with attributes."""
+    def listdir_attr(self, path: str):
+        """List directory contents with attributes using smbclient.scandir."""
+        full_path = self._full_path(path)
         try:
-            full_path = f"{self.base_path}{path}"
             entries = []
-            for entry in smbclient.listdir_attr(full_path):
-                is_dir = (entry.st_mode & 0o170000) == 0o040000
-                mode = S_IFDIR if is_dir else S_IFREG
-                mtime = int(entry.st_mtime)
-                entries.append(FTPEntry(entry.name, mode, mtime))
+            with smbclient.scandir(full_path) as it:
+                for entry in it:
+                    try:
+                        stat_info = entry.stat()
+                        mode = S_IFDIR if entry.is_dir() else S_IFREG
+                        mtime = int(stat_info.st_mtime)
+                        entries.append(FTPEntry(entry.name, mode, mtime))
+                    except Exception as entry_err:
+                        logger.warning(f"SMB listdir_attr: skipping entry {entry.name} due to error: {entry_err}")
             logger.debug(f"SMB listdir: {path} found {len(entries)} entries")
             return entries
-        except FileNotFoundError:
-            logger.debug(f"SMB listdir_attr FileNotFoundError: {path}")
-            raise FileNotFoundError(path)
         except Exception as e:
-            logger.error(f"SMB listdir_attr error for {path}: {type(e).__name__}: {e}")
+            if _is_not_found(e):
+                logger.debug(f"SMB listdir_attr FileNotFoundError: {path}")
+                raise FileNotFoundError(path) from e
+            logger.error(f"SMB listdir_attr error for {path} ({full_path}): {type(e).__name__}: {e}")
             raise
 
-    def put(self, local_path, remote_path):
-        """Upload a file."""
-        full_path = f"{self.base_path}{remote_path}"
+    def put(self, local_path: str, remote_path: str):
+        """Upload a file in chunks to prevent memory spikes with large recordings."""
+        full_path = self._full_path(remote_path)
         with open(local_path, "rb") as local_file:
             with smbclient.open_file(full_path, mode="wb") as remote_file:
-                remote_file.write(local_file.read())
+                shutil.copyfileobj(local_file, remote_file, length=64 * 1024)
 
-    def utime(self, path, times):
-        """Set file modification time."""
+    def utime(self, path: str, times):
+        """Set file modification time on remote SMB storage."""
+        full_path = self._full_path(path)
         try:
-            full_path = f"{self.base_path}{path}"
-            smbclient.stat(full_path)  # Verify file exists
-            logger.debug(f"SMB: cannot preserve mtime for {path}, using transfer time instead")
+            smbclient.utime(full_path, times=times)
+            logger.debug(f"SMB: Preserved mtime for {path}: {times}")
         except Exception as e:
-            logger.warning(f"Could not set mtime for {path}: {e}")
+            logger.warning(f"Could not set mtime for {path} ({full_path}): {e}")
 
-    def mkdir(self, path):
+    def mkdir(self, path: str):
         """Create a directory."""
-        full_path = f"{self.base_path}{path}"
+        clean = path.replace("\\", "/").strip("/")
+        if not clean or clean == ".":
+            return
+        full_path = self._full_path(path)
         try:
             smbclient.mkdir(full_path)
-        except FileExistsError:
-            pass  # Directory already exists
+            logger.debug(f"SMB mkdir created: {full_path}")
         except Exception as e:
-            # Handle "already exists" errors gracefully
-            if "exists" in str(e).lower():
+            if _is_already_exists(e):
                 return
-            logger.error(f"SMB mkdir error for {path}: {type(e).__name__}: {e}")
+            logger.error(f"SMB mkdir error for {path} ({full_path}): {type(e).__name__}: {e}")
             raise
 
-    def rmdir(self, path):
+    def rmdir(self, path: str):
         """Remove an empty directory."""
-        full_path = f"{self.base_path}{path}"
-        smbclient.rmdir(full_path)
+        clean = path.replace("\\", "/").strip("/")
+        if not clean or clean == ".":
+            raise OSError("Refusing to remove root directory")
+        full_path = self._full_path(path)
+        try:
+            smbclient.rmdir(full_path)
+            logger.debug(f"SMB rmdir removed: {full_path}")
+        except Exception as e:
+            if _is_not_found(e):
+                return
+            # cleanup_remote expects OSError if directory is not empty
+            raise OSError(str(e)) from e
 
-    def remove(self, path):
+    def remove(self, path: str):
         """Remove a file."""
-        full_path = f"{self.base_path}{path}"
-        smbclient.remove(full_path)
+        full_path = self._full_path(path)
+        try:
+            smbclient.remove(full_path)
+            logger.debug(f"SMB remove removed: {full_path}")
+        except Exception as e:
+            if _is_not_found(e):
+                return
+            logger.error(f"SMB remove error for {path} ({full_path}): {type(e).__name__}: {e}")
+            raise
 
     def close(self):
-        """Close the SMB session."""
+        """Close the SMB session and clear connection cache."""
         try:
             logger.debug("SMB session closing")
+            smbclient.reset_connection_cache()
         except Exception as e:
             logger.warning(f"Error closing SMB session: {e}")
+
 
 def write_log(status, uploaded, removed, error=""):
     """Append one row per sync run to the CSV log, creating it (with header) if needed."""
@@ -261,28 +377,11 @@ def write_log(status, uploaded, removed, error=""):
     except OSError as e:
         logger.error(f"Could not write log file {LOG_FILE}: {e}")
 
+
 def get_cutoff_time(days):
     """Return a datetime object for the cutoff time."""
     return datetime.now(timezone.utc) - timedelta(days=days)
 
-def parse_frigate_path(file_path):
-    """
-    Frigate stores recordings in: YYYY-MM-DD/HH/camera_name/MM.SS.mp4
-    This extracts the file's date from the path.
-    """
-    try:
-        # Split the path and get the date part (YYYY-MM-DD)
-        parts = file_path.split(os.sep)
-        # Find the part that looks like a date
-        for part in parts:
-            try:
-                datetime.strptime(part, "%Y-%m-%d")
-                return part
-            except ValueError:
-                continue
-    except Exception:
-        pass
-    return None
 
 def should_upload_file(file_path, cutoff_time):
     """Determine if a file should be uploaded based on its modification time."""
@@ -293,25 +392,32 @@ def should_upload_file(file_path, cutoff_time):
     except OSError:
         return False
 
+
 def ensure_remote_dir(sftp, remote_dir):
     """Recursively create remote directories if they don't exist."""
+    clean_dir = remote_dir.replace("\\", "/").rstrip("/")
+    if not clean_dir or clean_dir == ".":
+        return
+
     try:
-        sftp.stat(remote_dir)
-        logger.debug(f"Remote directory exists: {remote_dir}")
-    except FileNotFoundError:
-        logger.debug(f"Remote directory not found, creating: {remote_dir}")
-        parent = os.path.dirname(remote_dir)
-        if parent and parent != remote_dir:
+        sftp.stat(clean_dir)
+        logger.debug(f"Remote directory exists: {clean_dir}")
+    except (FileNotFoundError, OSError) as e:
+        if not _is_not_found(e):
+            logger.error(f"Error checking directory {clean_dir}: {e}")
+            raise
+        logger.debug(f"Remote directory not found, creating: {clean_dir}")
+        parent = os.path.dirname(clean_dir)
+        if parent and parent != clean_dir and parent not in ("/", "\\", "."):
             ensure_remote_dir(sftp, parent)
         try:
-            sftp.mkdir(remote_dir)
-            logger.info(f"Created remote directory: {remote_dir}")
-        except Exception as e:
-            logger.error(f"Failed to create directory {remote_dir}: {e}")
-            raise
-    except Exception as e:
-        logger.error(f"Error checking/creating directory {remote_dir}: {e}")
-        raise
+            sftp.mkdir(clean_dir)
+            logger.info(f"Created remote directory: {clean_dir}")
+        except Exception as mk_err:
+            if not _is_already_exists(mk_err):
+                logger.error(f"Failed to create directory {clean_dir}: {mk_err}")
+                raise
+
 
 def compress_file(local_path):
     """Compress a single local file into a temporary zip archive and return its path."""
@@ -321,66 +427,88 @@ def compress_file(local_path):
         zf.write(local_path, arcname=os.path.basename(local_path))
     return zip_path
 
-def upload_file(sftp, local_path, remote_path, mtime=None):
-    """Upload a single file, creating directories as needed."""
-    try:
-        remote_dir = os.path.dirname(remote_path)
-        ensure_remote_dir(sftp, remote_dir)
-        sftp.put(local_path, remote_path)
-        # Preserve the original recording's mtime so "already copied" checks and
-        # remote cleanup work off the recording time, not the upload time.
-        local_mtime = int(mtime if mtime is not None else os.path.getmtime(local_path))
-        sftp.utime(remote_path, (local_mtime, local_mtime))
-        logger.info(f"Uploaded: {local_path} -> {remote_path}")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to upload {local_path}: {e}")
-        return False
 
-def get_remote_files(sftp, remote_dir):
-    """Recursively get all files and their modification times from remote."""
-    files = {}
-    try:
-        for entry in sftp.listdir_attr(remote_dir):
-            remote_path = os.path.join(remote_dir, entry.filename)
-            if S_ISDIR(entry.st_mode):
-                files.update(get_remote_files(sftp, remote_path))
+def upload_file(sftp, local_path, remote_path, mtime=None):
+    """Upload a single file with retries, creating directories as needed."""
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            remote_dir = os.path.dirname(remote_path)
+            ensure_remote_dir(sftp, remote_dir)
+            sftp.put(local_path, remote_path)
+            # Preserve the original recording's mtime so "already copied" checks and
+            # remote cleanup work off the recording time, not the upload time.
+            local_mtime = int(mtime if mtime is not None else os.path.getmtime(local_path))
+            sftp.utime(remote_path, (local_mtime, local_mtime))
+            logger.info(f"Uploaded: {local_path} -> {remote_path}")
+            return True
+        except Exception as e:
+            logger.warning(f"Upload attempt {attempt}/{max_retries} failed for {local_path}: {e}")
+            if attempt < max_retries:
+                time.sleep(2 * attempt)
             else:
-                files[remote_path] = entry.st_mtime
-    except FileNotFoundError:
-        pass
-    return files
+                logger.error(f"Failed to upload {local_path} after {max_retries} attempts: {e}")
+                return False
+
 
 def cleanup_remote(sftp, remote_dir, cutoff_time):
     """
     Recursively delete remote files older than cutoff_time.
     Also removes empty directories. Returns the number of files removed.
     """
+    # Safety guard: NEVER run cleanup on the root directory
+    if not remote_dir or remote_dir.replace("\\", "/").strip("/") in ("", "."):
+        logger.error(f"SAFETY GUARD: Refusing to run cleanup on root directory: {remote_dir!r}")
+        return 0
+
     removed_count = 0
     try:
-        for entry in sftp.listdir_attr(remote_dir):
-            remote_path = os.path.join(remote_dir, entry.filename)
-            if S_ISDIR(entry.st_mode):
-                removed_count += cleanup_remote(sftp, remote_path, cutoff_time)
-                # Remove directory if empty
+        entries = sftp.listdir_attr(remote_dir)
+    except Exception as e:
+        if _is_not_found(e):
+            return 0
+        logger.error(f"Error listing remote directory {remote_dir} during cleanup: {e}")
+        return 0
+
+    for entry in entries:
+        remote_path = f"{remote_dir.rstrip('/\\')}/{entry.filename}"
+        if S_ISDIR(entry.st_mode):
+            removed_count += cleanup_remote(sftp, remote_path, cutoff_time)
+            # Remove directory if empty
+            try:
+                sftp.rmdir(remote_path)
+                logger.info(f"Removed empty remote directory: {remote_path}")
+            except OSError:
+                pass  # Directory not empty or cannot be removed
+        else:
+            # Check if file is older than cutoff
+            file_time = datetime.fromtimestamp(entry.st_mtime, tz=timezone.utc)
+            if file_time < cutoff_time:
                 try:
-                    sftp.rmdir(remote_path)
-                    logger.info(f"Removed empty remote directory: {remote_path}")
-                except OSError:
-                    pass  # Directory not empty
-            else:
-                # Check if file is older than cutoff
-                file_time = datetime.fromtimestamp(entry.st_mtime, tz=timezone.utc)
-                if file_time < cutoff_time:
                     sftp.remove(remote_path)
                     removed_count += 1
                     logger.info(f"Removed old remote file: {remote_path}")
-    except FileNotFoundError:
-        pass
+                except Exception as e:
+                    logger.warning(f"Failed to remove old file {remote_path}: {e}")
+
     return removed_count
+
 
 def sync_frigate_to_sftp():
     """Main sync function."""
+    clean_base = REMOTE_BASE_PATH.replace("\\", "/").strip("/")
+    if not clean_base or clean_base == ".":
+        raise ValueError(
+            "CRITICAL SAFETY ERROR: REMOTE_BASE_PATH cannot be '/' or empty. "
+            "Cleanup scans REMOTE_BASE_PATH and deletes all files older than DAYS_TO_KEEP. "
+            "Setting REMOTE_BASE_PATH to root would delete non-Frigate data on your SMB share "
+            "or storage (e.g., other folders like 'mqtt'). "
+            "Please configure REMOTE_BASE_PATH to a dedicated subfolder (e.g. REMOTE_BASE_PATH=/frigate_backup)."
+        )
+
+    if DAYS_TO_KEEP <= 0:
+        raise ValueError(f"DAYS_TO_KEEP must be a positive integer, got {DAYS_TO_KEEP}")
+
     cutoff = get_cutoff_time(DAYS_TO_KEEP)
     logger.info(f"Syncing files newer than: {cutoff.isoformat()}")
 
@@ -399,7 +527,16 @@ def sync_frigate_to_sftp():
                 raise ValueError("SMB mode requires SFTP_PASSWORD for authentication.")
             if not SMB_VOLUME:
                 raise ValueError("SMB mode requires SMB_VOLUME to be set.")
-            sftp = SMBAdapter(SFTP_HOST, SFTP_USERNAME, SFTP_PASSWORD, SMB_VOLUME)
+            sftp = SMBAdapter(
+                SFTP_HOST,
+                SFTP_USERNAME,
+                SFTP_PASSWORD,
+                SMB_VOLUME,
+                port=SMB_PORT,
+                timeout=SMB_TIMEOUT,
+                retries=CONNECT_RETRIES,
+                retry_delay=CONNECT_RETRY_DELAY,
+            )
         elif USE_FTP:
             if not SFTP_PASSWORD:
                 raise ValueError("FTP mode requires SFTP_PASSWORD (key auth is SFTP-only).")
@@ -469,7 +606,6 @@ def sync_frigate_to_sftp():
                         continue
                 except Exception:
                     # If stat fails (file not found or any error), we'll try to upload
-                    # This is faster than checking every file - let upload handle errors
                     logger.debug(f"Remote file check failed (will attempt upload): {remote_path}")
                     pass
 
@@ -501,6 +637,7 @@ def sync_frigate_to_sftp():
                 logger.debug("Closed SSH connection")
             except Exception as e:
                 logger.warning(f"Error closing SSH: {e}")
+
 
 if __name__ == "__main__":
     try:

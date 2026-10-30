@@ -2,3 +2,4 @@
 test.conf
 .claude/
 __pycache__/
+.pytest_cache/
