@@ -487,8 +487,9 @@ def cleanup_remote(sftp, remote_dir, cutoff_time):
         logger.error(f"Error listing remote directory {remote_dir} during cleanup: {e}")
         return 0
 
+    clean_remote_dir = remote_dir.replace("\\", "/").rstrip("/")
     for entry in entries:
-        remote_path = f"{remote_dir.rstrip('/\\')}/{entry.filename}"
+        remote_path = f"{clean_remote_dir}/{entry.filename}"
         if S_ISDIR(entry.st_mode):
             removed_count += cleanup_remote(sftp, remote_path, cutoff_time)
             # Remove directory if empty
