@@ -8,13 +8,17 @@ if ! wg show 2>/dev/null | grep -q 'interface:'; then
 fi
 
 # 2. Check the status of the most recent sync run in LOG_FILE
+if [ -f /app/container.env ]; then
+    # shellcheck disable=SC1091
+    . /app/container.env
+fi
 LOG_FILE="${LOG_FILE:-/logs/sync.csv}"
 if [ -f "$LOG_FILE" ]; then
-    python3 - <<EOF
+    python3 - "$LOG_FILE" <<'EOF'
 import csv
 import sys
 
-log_file = "$LOG_FILE"
+log_file = sys.argv[1]
 try:
     with open(log_file, "r", newline="") as f:
         rows = [row for row in csv.reader(f) if row]

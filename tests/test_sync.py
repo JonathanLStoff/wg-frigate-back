@@ -173,11 +173,9 @@ class TestSafetyGuards:
     def test_cleanup_remote_refuses_root(self):
         mock_sftp = MagicMock()
         cutoff = 1700000000
-        # Root variations
-        assert cleanup_remote(mock_sftp, "/", cutoff) == 0
-        assert cleanup_remote(mock_sftp, "", cutoff) == 0
-        assert cleanup_remote(mock_sftp, ".", cutoff) == 0
-        assert cleanup_remote(mock_sftp, "\\", cutoff) == 0
+        # Root and traversal variations
+        for bad_path in ("/", "", ".", "\\", "/.", "/./", "/frigate/../", "../"):
+            assert cleanup_remote(mock_sftp, bad_path, cutoff) == 0
 
         # listdir_attr should NOT have been called
         mock_sftp.listdir_attr.assert_not_called()
@@ -217,7 +215,30 @@ class TestUploadFile:
         success = upload_file(mock_sftp, "/local/path.zip", "/remote/path.zip")
         assert success is True
         assert mock_sftp.put.call_count == 2
+        mock_sftp.remove.assert_called_once_with("/remote/path.zip")
         mock_sftp.utime.assert_called_once_with("/remote/path.zip", (1700000000, 1700000000))
+
+    @patch("sync.should_upload_file", return_value=True)
+    @patch("sync.cleanup_remote", return_value=0)
+    @patch("sync.ensure_remote_dir")
+    @patch("sync.os.walk", return_value=[("/recordings/cam1", [], ["clip.mp4"])])
+    @patch("sync.os.path.getmtime", return_value=1700000000.789)
+    @patch("sync.USE_SMB", True)
+    @patch("sync.SFTP_PASSWORD", "pass")
+    @patch("sync.SMB_VOLUME", "backup")
+    @patch("sync.SMBAdapter")
+    def test_skips_file_when_subsecond_mtime_matches_truncated_remote_mtime(
+        self, mock_smb_cls, mock_mtime, mock_walk, mock_ensure, mock_cleanup, mock_should
+    ):
+        mock_sftp = MagicMock()
+        # Remote server stores integer mtime (1700000000), while local has float (1700000000.789)
+        mock_sftp.stat.return_value = FTPEntry("clip.mp4.zip", stat.S_IFREG, 1700000000)
+        mock_smb_cls.return_value = mock_sftp
+
+        uploaded, failed, removed = sync_frigate_to_sftp()
+        assert uploaded == 0
+        assert failed == 0
+        mock_sftp.put.assert_not_called()
 
 
 class TestEnsureRemoteDir:

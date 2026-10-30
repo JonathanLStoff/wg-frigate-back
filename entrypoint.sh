@@ -75,11 +75,11 @@ if ! validate_schedule "$SCHEDULE"; then
     exit 1
 fi
 
-# Safety validation: REMOTE_BASE_PATH must not be root (e.g. '/')
-REMOTE_PATH="${REMOTE_BASE_PATH:-/backup/frigate}"
+# Safety validation: REMOTE_BASE_PATH must not be root (e.g. '/'), empty, or contain '..'
+REMOTE_PATH="${REMOTE_BASE_PATH-/backup/frigate}"
 CLEAN_REMOTE_PATH="$(echo "$REMOTE_PATH" | tr '\\' '/' | sed -e 's|^/*||' -e 's|/*$||')"
-if [ -z "$CLEAN_REMOTE_PATH" ] || [ "$CLEAN_REMOTE_PATH" = "." ]; then
-    echo "CRITICAL SAFETY ERROR: REMOTE_BASE_PATH cannot be '/' or empty." >&2
+if [ -z "$CLEAN_REMOTE_PATH" ] || [ "$CLEAN_REMOTE_PATH" = "." ] || [[ "/$CLEAN_REMOTE_PATH/" == *"/../"* ]] || [[ "/$CLEAN_REMOTE_PATH/" == *"/./"* ]]; then
+    echo "CRITICAL SAFETY ERROR: REMOTE_BASE_PATH cannot be '/', empty, or contain '..'." >&2
     echo "Cleanup would delete all files older than DAYS_TO_KEEP on the root of the storage (e.g. other folders like mqtt)." >&2
     echo "Please set REMOTE_BASE_PATH to a dedicated subfolder (e.g. /frigate_backup)." >&2
     exit 1

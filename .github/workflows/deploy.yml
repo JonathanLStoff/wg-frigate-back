@@ -15,7 +15,26 @@ env:
   IMAGE_NAME: wg-frigate-back
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: pip install paramiko smbprotocol pytest
+
+      - name: Run unit tests
+        run: pytest -v
+
   build-and-push:
+    needs: test
     runs-on: ubuntu-latest
 
     steps:

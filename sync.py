@@ -80,6 +80,16 @@ def _is_already_exists(e: Exception) -> bool:
     return any(term in msg for term in ("0xc0000035", "already exists", "file exists"))
 
 
+def _is_unsafe_remote_path(path: str) -> bool:
+    """Return True if a remote path resolves to root, empty, current dir, or uses '..' traversal."""
+    if not path or not path.strip():
+        return True
+    parts = [p for p in path.replace("\\", "/").split("/") if p and p != "."]
+    if not parts or ".." in parts:
+        return True
+    return False
+
+
 class FTPEntry:
     """Directory entry with the attributes cleanup/sync code reads (paramiko-style)."""
     def __init__(self, filename, st_mode, st_mtime):
@@ -213,6 +223,7 @@ class SMBAdapter:
         logger.info(f"SMBAdapter: Credentials registered for {self.host}")
 
         # Verify connection with retries to tolerate slow WireGuard handshakes or transient network drops
+        retries = max(1, int(retries))
         last_err = None
         for attempt in range(1, retries + 1):
             try:
@@ -279,6 +290,8 @@ class SMBAdapter:
             entries = []
             with smbclient.scandir(full_path) as it:
                 for entry in it:
+                    if entry.name in ("", ".", ".."):
+                        continue
                     try:
                         stat_info = entry.stat()
                         mode = S_IFDIR if entry.is_dir() else S_IFREG
@@ -444,6 +457,10 @@ def upload_file(sftp, local_path, remote_path, mtime=None):
             return True
         except Exception as e:
             logger.warning(f"Upload attempt {attempt}/{max_retries} failed for {local_path}: {e}")
+            try:
+                sftp.remove(remote_path)
+            except Exception:
+                pass
             if attempt < max_retries:
                 time.sleep(2 * attempt)
             else:
@@ -457,8 +474,8 @@ def cleanup_remote(sftp, remote_dir, cutoff_time):
     Also removes empty directories. Returns the number of files removed.
     """
     # Safety guard: NEVER run cleanup on the root directory
-    if not remote_dir or remote_dir.replace("\\", "/").strip("/") in ("", "."):
-        logger.error(f"SAFETY GUARD: Refusing to run cleanup on root directory: {remote_dir!r}")
+    if _is_unsafe_remote_path(remote_dir):
+        logger.error(f"SAFETY GUARD: Refusing to run cleanup on unsafe/root directory: {remote_dir!r}")
         return 0
 
     removed_count = 0
@@ -496,10 +513,9 @@ def cleanup_remote(sftp, remote_dir, cutoff_time):
 
 def sync_frigate_to_sftp():
     """Main sync function."""
-    clean_base = REMOTE_BASE_PATH.replace("\\", "/").strip("/")
-    if not clean_base or clean_base == ".":
+    if _is_unsafe_remote_path(REMOTE_BASE_PATH):
         raise ValueError(
-            "CRITICAL SAFETY ERROR: REMOTE_BASE_PATH cannot be '/' or empty. "
+            "CRITICAL SAFETY ERROR: REMOTE_BASE_PATH cannot be '/', empty, or contain '..'. "
             "Cleanup scans REMOTE_BASE_PATH and deletes all files older than DAYS_TO_KEEP. "
             "Setting REMOTE_BASE_PATH to root would delete non-Frigate data on your SMB share "
             "or storage (e.g., other folders like 'mqtt'). "
@@ -594,12 +610,12 @@ def sync_frigate_to_sftp():
                 # zip-compressed before upload, so the remote name gets a .zip suffix
                 rel_path = os.path.relpath(local_path, LOCAL_RECORDINGS_PATH)
                 remote_path = os.path.join(REMOTE_BASE_PATH, rel_path).replace("\\", "/") + ".zip"
-                local_mtime = os.path.getmtime(local_path)
+                local_mtime = int(os.path.getmtime(local_path))
 
                 # Check if file already exists remotely and is up-to-date
                 try:
                     remote_attr = sftp.stat(remote_path)
-                    remote_mtime = remote_attr.st_mtime
+                    remote_mtime = int(remote_attr.st_mtime)
                     # If remote file is newer or same age, skip
                     if remote_mtime >= local_mtime:
                         logger.debug(f"Skipping (up-to-date): {remote_path}")

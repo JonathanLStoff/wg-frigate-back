@@ -4,7 +4,7 @@ X ?= 11
 PYTHON_VERSION := 3.$(X)
 
 # Docker configuration
-IMAGE_NAME ?= my-python-app
+IMAGE_NAME ?= wg-frigate-back
 REGISTRY   ?= my-docker-registry.com
 TAG        := $(PYTHON_VERSION)
 FULL_IMAGE := $(REGISTRY)/$(IMAGE_NAME):$(TAG)
@@ -21,6 +21,7 @@ build: ## Build the Docker image with the specified Python version
 	@echo "========================================="
 	docker build \
 		--build-arg PYTHON_VERSION=$(PYTHON_VERSION) \
+		-f DockerFile \
 		-t $(IMAGE_NAME):$(TAG) \
 		-t $(FULL_IMAGE) .
 
