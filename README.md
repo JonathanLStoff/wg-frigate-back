@@ -13,8 +13,11 @@ On container start, [entrypoint.sh](entrypoint.sh):
    `DNS =` lines** (the slim image has no `resolvconf`, which `wg-quick` would
    otherwise require), and brings the tunnel up with `wg-quick`. All traffic is
    routed through the tunnel when the config's `AllowedIPs` covers `0.0.0.0/0`.
-3. Installs the cron job and snapshots the container's environment so scheduled
-   runs see the same variables (cron otherwise starts jobs with an empty env).
+3. Cleans up any leftover `/tmp/*.zip` files and installs the cron job wrapped in
+   `flock -n /tmp/cron-sync.lock` (paired with an in-process `fcntl.flock` lock in
+   `sync.py`) so overlapping backup runs are impossible. Snapshots the container's
+   environment so scheduled runs see the same variables (cron otherwise starts jobs
+   with an empty env).
 4. Runs `/app/sync.py` once as the initial backup (a failure is logged, not fatal).
 5. Hands off to `cron -f`, which keeps the container running and fires the
    scheduled backups. Job output goes to `docker logs`.
@@ -76,6 +79,8 @@ LOG_FILE=/logs/sync.csv  # CSV run log: timestamp, success/failure, files upload
 USE_FTP=false  # Set to true to upload over plain FTP instead of SFTP
 USE_SMB=false  # Set to true to upload over SMB/Samba instead of SFTP
 SMB_VOLUME=backup  # SMB shared volume/folder name (required if USE_SMB=true)
+COMPRESS_FILES=true  # Set to false to upload .mp4 files directly without .zip compression
+DEBUG=false  # Verbose sync logging (smbprotocol/spnego/paramiko packet dumps remain silenced)
 ```
 
 Notes:
@@ -125,6 +130,11 @@ docker run -d \
   --name wg-frigate-back \
   --cap-add NET_ADMIN \
   --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+  --memory=512m \
+  --memory-swap=1g \
+  --pids-limit=32 \
+  --cpu-shares=256 \
+  --oom-score-adj=500 \
   --restart unless-stopped \
   -v /path/to/wg0.conf:/etc/wireguard/wg0.conf:ro \
   -v /path/to/frigate/recordings:/recordings:ro \
@@ -160,6 +170,11 @@ services:
       - NET_ADMIN
     sysctls:
       net.ipv4.conf.all.src_valid_mark: 1
+    mem_limit: 512m
+    memswap_limit: 1g
+    pids_limit: 32
+    cpu_shares: 256
+    oom_score_adj: 500
     restart: unless-stopped
     volumes:
       - /path/to/wg0.conf:/etc/wireguard/wg0.conf:ro

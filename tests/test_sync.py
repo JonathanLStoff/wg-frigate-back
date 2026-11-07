@@ -14,6 +14,7 @@ from sync import (
     _is_already_exists,
     FTPEntry,
     SMBAdapter,
+    acquire_lock,
     ensure_remote_dir,
     cleanup_remote,
     sync_frigate_to_sftp,
@@ -221,7 +222,7 @@ class TestUploadFile:
     @patch("sync.should_upload_file", return_value=True)
     @patch("sync.cleanup_remote", return_value=0)
     @patch("sync.ensure_remote_dir")
-    @patch("sync.os.walk", return_value=[("/recordings/cam1", [], ["clip.mp4"])])
+    @patch("sync.os.walk", return_value=[("/media/frigate/recordings/cam1", [], ["clip.mp4"])])
     @patch("sync.os.path.getmtime", return_value=1700000000.789)
     @patch("sync.USE_SMB", True)
     @patch("sync.SFTP_PASSWORD", "pass")
@@ -232,13 +233,41 @@ class TestUploadFile:
     ):
         mock_sftp = MagicMock()
         # Remote server stores integer mtime (1700000000), while local has float (1700000000.789)
-        mock_sftp.stat.return_value = FTPEntry("clip.mp4.zip", stat.S_IFREG, 1700000000)
+        mock_sftp.listdir_attr.return_value = [FTPEntry("clip.mp4.zip", stat.S_IFREG, 1700000000)]
         mock_smb_cls.return_value = mock_sftp
 
         uploaded, failed, removed = sync_frigate_to_sftp()
         assert uploaded == 0
         assert failed == 0
         mock_sftp.put.assert_not_called()
+        mock_sftp.stat.assert_not_called()
+
+    @patch("sync.compress_file", side_effect=lambda p: p + ".tmp.zip")
+    @patch("sync.os.remove")
+    @patch("sync.should_upload_file", return_value=True)
+    @patch("sync.cleanup_remote", return_value=0)
+    @patch("sync.os.walk", return_value=[("/media/frigate/recordings/cam1", [], ["a.mp4", "b.mp4", "c.mp4"])])
+    @patch("sync.os.path.getmtime", return_value=1700000050)
+    @patch("sync.USE_SMB", True)
+    @patch("sync.SFTP_PASSWORD", "pass")
+    @patch("sync.SMB_VOLUME", "backup")
+    @patch("sync.SMBAdapter")
+    def test_batches_listdir_and_caches_ensured_dirs(
+        self, mock_smb_cls, mock_mtime, mock_walk, mock_cleanup, mock_should, mock_remove, mock_compress
+    ):
+        mock_sftp = MagicMock()
+        # a.mp4.zip is already up-to-date, b.mp4 and c.mp4 need upload
+        mock_sftp.listdir_attr.return_value = [FTPEntry("a.mp4.zip", stat.S_IFREG, 1700000050)]
+        mock_smb_cls.return_value = mock_sftp
+
+        uploaded, failed, removed = sync_frigate_to_sftp()
+        assert uploaded == 2
+        assert failed == 0
+        # listdir_attr called only once for /backup/frigate/cam1
+        mock_sftp.listdir_attr.assert_called_once_with("/backup/frigate/cam1")
+        # stat called only once (for REMOTE_BASE_PATH at start), never per-file or per-upload!
+        mock_sftp.stat.assert_called_once_with("/backup/frigate")
+        assert mock_sftp.put.call_count == 2
 
 
 class TestEnsureRemoteDir:
@@ -252,9 +281,43 @@ class TestEnsureRemoteDir:
 
         mock_sftp.stat.side_effect = mock_stat
 
-        ensure_remote_dir(mock_sftp, "/backup/frigate")
+        ensured = set()
+        ensure_remote_dir(mock_sftp, "/backup/frigate", ensured_dirs=ensured)
 
         mock_sftp.mkdir.assert_called_once_with("/backup/frigate")
+        assert "/backup/frigate" in ensured
+        assert "/backup" in ensured
+
+        # Calling again with the same cache performs zero stat/mkdir calls
+        mock_sftp.stat.reset_mock()
+        mock_sftp.mkdir.reset_mock()
+        ensure_remote_dir(mock_sftp, "/backup/frigate", ensured_dirs=ensured)
+        mock_sftp.stat.assert_not_called()
+        mock_sftp.mkdir.assert_not_called()
+
         # Ensure it never attempts to mkdir on "/"
         for call in mock_sftp.mkdir.call_args_list:
             assert call.args[0] not in ("/", "\\", "")
+
+
+class TestLockingAndLogging:
+    def test_acquire_lock_prevents_concurrent_runs(self, tmp_path):
+        lock_file = str(tmp_path / "sync.lock")
+        lock1 = acquire_lock(lock_file)
+        assert lock1 is not None
+        try:
+            lock2 = acquire_lock(lock_file)
+            assert lock2 is None
+        finally:
+            lock1.close()
+
+        # After closing lock1, lock can be acquired again
+        lock3 = acquire_lock(lock_file)
+        assert lock3 is not None
+        lock3.close()
+
+    def test_noisy_loggers_silenced(self):
+        import logging
+        assert logging.getLogger("smbprotocol").level >= logging.WARNING
+        assert logging.getLogger("spnego").level >= logging.WARNING
+        assert logging.getLogger("paramiko").level >= logging.WARNING

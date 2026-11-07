@@ -122,6 +122,9 @@ echo "Bringing up WireGuard tunnel from $WG_RUNTIME_CONF (DNS lines stripped)...
 wg-quick up "$WG_RUNTIME_CONF"
 wg show
 
+# Clean up any leftover temporary zip files from previous interrupted runs
+rm -f /tmp/*.zip
+
 # cron starts jobs with an almost-empty environment, so snapshot the
 # container's env (SFTP_*, paths, ...) for the job to source at run time.
 export -p > /app/container.env
@@ -129,17 +132,18 @@ chmod 600 /app/container.env
 
 # /proc/1/fd/1|2 sends the job's output to the container's stdout/stderr
 # so `docker logs` picks it up.
+# Use flock -n /tmp/cron-sync.lock so cron never spawns a second sync while one is already running.
 {
     echo "SHELL=/bin/bash"
-    echo "$SCHEDULE . /app/container.env; python3 /app/sync.py >> /proc/1/fd/1 2>> /proc/1/fd/2"
+    echo "$SCHEDULE . /app/container.env; /usr/bin/flock -n /tmp/cron-sync.lock python3 /app/sync.py >> /proc/1/fd/1 2>> /proc/1/fd/2"
 } | crontab -
 
-echo "Backup schedule installed: $SCHEDULE -> python3 /app/sync.py"
+echo "Backup schedule installed: $SCHEDULE -> flock -n /tmp/cron-sync.lock python3 /app/sync.py"
 
 # Initial run so the first backup doesn't wait for the schedule to come around.
 # A failure here is logged but doesn't kill the container; cron retries on schedule.
 echo "Running initial sync..."
-if python3 /app/sync.py; then
+if /usr/bin/flock -n /tmp/cron-sync.lock python3 /app/sync.py; then
     echo "Initial sync completed."
 else
     echo "WARNING: initial sync failed with exit code $? - cron will retry on schedule." >&2
